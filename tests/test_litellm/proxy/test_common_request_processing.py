@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import litellm
 from litellm._uuid import uuid
@@ -11,9 +11,11 @@ from litellm.integrations.opentelemetry import UserAPIKeyAuth
 from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     ProxyConfig,
+    _extract_error_from_sse_chunk,
     _get_cost_breakdown_from_logging_obj,
+    _override_openai_response_model,
     _parse_event_data_for_error,
-    create_streaming_response,
+    create_response,
 )
 from litellm.proxy.utils import ProxyLogging
 
@@ -74,6 +76,93 @@ class TestProxyBaseLLMRequestProcessing:
         except ValueError:
             pytest.fail("litellm_call_id is not a valid UUID")
         assert data_passed["litellm_call_id"] == returned_data["litellm_call_id"]
+
+    @pytest.mark.asyncio
+    async def test_should_apply_hierarchical_router_settings_as_override(
+        self, monkeypatch
+    ):
+        """
+        Test that hierarchical router settings are stored as router_settings_override
+        instead of creating a full user_config with model_list.
+        
+        This approach avoids expensive per-request Router instantiation by passing
+        settings as kwargs overrides to the main router.
+        """
+        processing_obj = ProxyBaseLLMRequestProcessing(data={})
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+
+        async def mock_add_litellm_data_to_request(*args, **kwargs):
+            return {}
+
+        async def mock_common_processing_pre_call_logic(
+            user_api_key_dict, data, call_type
+        ):
+            data_copy = copy.deepcopy(data)
+            return data_copy
+
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.pre_call_hook = AsyncMock(
+            side_effect=mock_common_processing_pre_call_logic
+        )
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "add_litellm_data_to_request",
+            mock_add_litellm_data_to_request,
+        )
+
+        mock_general_settings = {}
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_proxy_config = MagicMock(spec=ProxyConfig)
+        
+        mock_router_settings = {
+            "routing_strategy": "least-busy",
+            "timeout": 30.0,
+            "num_retries": 3,
+        }
+        mock_proxy_config._get_hierarchical_router_settings = AsyncMock(
+            return_value=mock_router_settings
+        )
+
+        mock_llm_router = MagicMock()
+
+        mock_prisma_client = MagicMock()
+        monkeypatch.setattr(
+            "litellm.proxy.proxy_server.prisma_client",
+            mock_prisma_client,
+        )
+
+        route_type = "acompletion"
+
+        returned_data, logging_obj = await processing_obj.common_processing_pre_call_logic(
+            request=mock_request,
+            general_settings=mock_general_settings,
+            user_api_key_dict=mock_user_api_key_dict,
+            proxy_logging_obj=mock_proxy_logging_obj,
+            proxy_config=mock_proxy_config,
+            route_type=route_type,
+            llm_router=mock_llm_router,
+        )
+
+        mock_proxy_config._get_hierarchical_router_settings.assert_called_once_with(
+            user_api_key_dict=mock_user_api_key_dict,
+            prisma_client=mock_prisma_client,
+            proxy_logging_obj=mock_proxy_logging_obj,
+        )
+        # get_model_list should NOT be called - we no longer copy model list for per-request routers
+        mock_llm_router.get_model_list.assert_not_called()
+
+        # Settings should be stored as router_settings_override (not user_config)
+        # This allows passing them as kwargs to the main router instead of creating a new one
+        assert "router_settings_override" in returned_data
+        assert "user_config" not in returned_data
+        
+        router_settings_override = returned_data["router_settings_override"]
+        assert router_settings_override["routing_strategy"] == "least-busy"
+        assert router_settings_override["timeout"] == 30.0
+        assert router_settings_override["num_retries"] == 3
+        # model_list should NOT be in the override settings
+        assert "model_list" not in router_settings_override
 
     @pytest.mark.asyncio
     async def test_stream_timeout_header_processing(self):
@@ -602,21 +691,27 @@ class TestCommonRequestProcessingHelpers:
         assert await _parse_event_data_for_error(event_line) == expected_code
 
     async def test_create_streaming_response_first_chunk_is_error(self):
+        """
+        Test that when the first chunk is an error, a JSON error response is returned
+        instead of an SSE streaming response
+        """
         async def mock_generator():
             yield 'data: {"error": {"code": 403, "message": "forbidden"}}\n\n'
             yield 'data: {"content": "more data"}\n\n'
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
+        # Should return JSONResponse instead of StreamingResponse
+        assert isinstance(response, JSONResponse)
         assert response.status_code == status.HTTP_403_FORBIDDEN
-        content = await self.consume_stream(response)
-        assert content == [
-            'data: {"error": {"code": 403, "message": "forbidden"}}\n\n',
-            'data: {"content": "more data"}\n\n',
-            "data: [DONE]\n\n",
-        ]
+        # Verify the response is in standard JSON error format
+        import json
+        body = json.loads(response.body.decode())
+        assert "error" in body
+        assert body["error"]["code"] == 403
+        assert body["error"]["message"] == "forbidden"
 
     async def test_create_streaming_response_first_chunk_not_error(self):
         async def mock_generator():
@@ -624,7 +719,7 @@ class TestCommonRequestProcessingHelpers:
             yield 'data: {"content": "second part"}\n\n'
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
         assert response.status_code == status.HTTP_200_OK
@@ -641,7 +736,7 @@ class TestCommonRequestProcessingHelpers:
                 yield
             # Implicitly raises StopAsyncIteration
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
         assert response.status_code == status.HTTP_200_OK
@@ -654,7 +749,7 @@ class TestCommonRequestProcessingHelpers:
         mock_gen = AsyncMock()
         mock_gen.__anext__.side_effect = StopAsyncIteration
 
-        response = await create_streaming_response(mock_gen, "text/event-stream", {})
+        response = await create_response(mock_gen, "text/event-stream", {})
         assert response.status_code == status.HTTP_200_OK
         content = await self.consume_stream(response)
         assert content == []
@@ -665,7 +760,7 @@ class TestCommonRequestProcessingHelpers:
         mock_gen = AsyncMock()
         mock_gen.__anext__.side_effect = ValueError("Test error from generator")
 
-        response = await create_streaming_response(mock_gen, "text/event-stream", {})
+        response = await create_response(mock_gen, "text/event-stream", {})
         assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
         content = await self.consume_stream(response)
         expected_error_data = {
@@ -682,19 +777,24 @@ class TestCommonRequestProcessingHelpers:
         assert content[1] == "data: [DONE]\n\n"
 
     async def test_create_streaming_response_first_chunk_error_string_code(self):
+        """
+        Test that when the first chunk contains a string error code, a JSON error response is returned
+        """
         async def mock_generator():
             yield 'data: {"error": {"code": "429", "message": "too many requests"}}\n\n'
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
+        assert isinstance(response, JSONResponse)
         assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-        content = await self.consume_stream(response)
-        assert content == [
-            'data: {"error": {"code": "429", "message": "too many requests"}}\n\n',
-            "data: [DONE]\n\n",
-        ]
+        # Verify the response is in standard JSON error format
+        import json
+        body = json.loads(response.body.decode())
+        assert "error" in body
+        assert body["error"]["code"] == "429"
+        assert body["error"]["message"] == "too many requests"
 
     async def test_create_streaming_response_custom_headers(self):
         async def mock_generator():
@@ -702,7 +802,7 @@ class TestCommonRequestProcessingHelpers:
             yield "data: [DONE]\n\n"
 
         custom_headers = {"X-Custom-Header": "TestValue"}
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", custom_headers
         )
         assert response.headers["x-custom-header"] == "TestValue"
@@ -712,7 +812,7 @@ class TestCommonRequestProcessingHelpers:
             yield 'data: {"content": "data"}\n\n'
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(),
             "text/event-stream",
             {},
@@ -729,7 +829,7 @@ class TestCommonRequestProcessingHelpers:
         async def mock_generator():
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
         assert response.status_code == status.HTTP_200_OK  # Default status
@@ -742,7 +842,7 @@ class TestCommonRequestProcessingHelpers:
             yield 'data: {"content": "actual data"}\n\n'
             yield "data: [DONE]\n\n"
 
-        response = await create_streaming_response(
+        response = await create_response(
             mock_generator(), "text/event-stream", {}
         )
         assert response.status_code == status.HTTP_200_OK  # Default status
@@ -773,7 +873,7 @@ class TestCommonRequestProcessingHelpers:
 
         # Patch the tracer in the common_request_processing module
         with patch("litellm.proxy.common_request_processing.tracer", mock_tracer):
-            response = await create_streaming_response(
+            response = await create_response(
                 mock_generator(), "text/event-stream", {}
             )
 
@@ -810,7 +910,10 @@ class TestCommonRequestProcessingHelpers:
                 ), f"Call {i} should have operation name 'streaming.chunk.yield', got {args[0]}"
 
     async def test_create_streaming_response_dd_trace_with_error_chunk(self):
-        """Test that dd trace is applied even when the first chunk contains an error"""
+        """
+        Test that when the first chunk contains an error, JSONResponse is returned
+        and tracing is not triggered (since it's not a streaming response)
+        """
         from unittest.mock import patch
 
         # Create a mock tracer
@@ -827,28 +930,333 @@ class TestCommonRequestProcessingHelpers:
 
         # Patch the tracer in the common_request_processing module
         with patch("litellm.proxy.common_request_processing.tracer", mock_tracer):
-            response = await create_streaming_response(
+            response = await create_response(
                 mock_generator(), "text/event-stream", {}
             )
 
-            # Even with error, status should be set to error code but tracing should still work
+            # Should return JSONResponse instead of StreamingResponse
+            assert isinstance(response, JSONResponse)
             assert response.status_code == 400
 
-            # Consume the stream to trigger the tracer calls
-            content = await self.consume_stream(response)
+            # Verify the response is in standard JSON error format
+            import json
+            body = json.loads(response.body.decode())
+            assert "error" in body
+            assert body["error"]["code"] == 400
+            assert body["error"]["message"] == "bad request"
 
-            # Verify all chunks are present
-            assert len(content) == 3
+            # Since JSONResponse is returned instead of StreamingResponse, streaming tracing should not be triggered
+            # tracer.trace should not be called
+            assert mock_tracer.trace.call_count == 0
 
-            # Verify that tracer.trace was called for each chunk
-            assert mock_tracer.trace.call_count == 3
 
-            # Verify that each call was made with the correct operation name
-            actual_calls = mock_tracer.trace.call_args_list
-            assert len(actual_calls) == 3
+class TestExtractErrorFromSSEChunk:
+    """Tests for _extract_error_from_sse_chunk function"""
 
-            for i, call in enumerate(actual_calls):
-                args, kwargs = call
-                assert (
-                    args[0] == "streaming.chunk.yield"
-                ), f"Call {i} should have operation name 'streaming.chunk.yield', got {args[0]}"
+    def test_extract_error_from_sse_chunk_with_valid_error(self):
+        """Test extracting error information from a standard SSE chunk"""
+        chunk = 'data: {"error": {"code": 403, "message": "forbidden", "type": "auth_error", "param": "api_key"}}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["code"] == 403
+        assert error["message"] == "forbidden"
+        assert error["type"] == "auth_error"
+        assert error["param"] == "api_key"
+
+    def test_extract_error_from_sse_chunk_with_string_code(self):
+        """Test error code as string type"""
+        chunk = 'data: {"error": {"code": "429", "message": "too many requests"}}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["code"] == "429"
+        assert error["message"] == "too many requests"
+
+    def test_extract_error_from_sse_chunk_with_bytes(self):
+        """Test input as bytes type"""
+        chunk = b'data: {"error": {"code": 500, "message": "internal error"}}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["code"] == 500
+        assert error["message"] == "internal error"
+
+    def test_extract_error_from_sse_chunk_with_done(self):
+        """Test [DONE] marker should return default error"""
+        chunk = "data: [DONE]\n\n"
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "Unknown error"
+        assert error["type"] == "internal_server_error"
+        assert error["code"] == "500"
+        assert error["param"] is None
+
+    def test_extract_error_from_sse_chunk_without_error_field(self):
+        """Test missing error field should return default error"""
+        chunk = 'data: {"content": "some content"}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "Unknown error"
+        assert error["type"] == "internal_server_error"
+        assert error["code"] == "500"
+
+    def test_extract_error_from_sse_chunk_with_invalid_json(self):
+        """Test invalid JSON should return default error"""
+        chunk = 'data: {invalid json}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "Unknown error"
+        assert error["type"] == "internal_server_error"
+        assert error["code"] == "500"
+
+    def test_extract_error_from_sse_chunk_without_data_prefix(self):
+        """Test missing 'data:' prefix should return default error"""
+        chunk = '{"error": {"code": 400, "message": "bad request"}}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "Unknown error"
+        assert error["type"] == "internal_server_error"
+        assert error["code"] == "500"
+
+    def test_extract_error_from_sse_chunk_with_empty_string(self):
+        """Test empty string should return default error"""
+        chunk = ""
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "Unknown error"
+        assert error["type"] == "internal_server_error"
+        assert error["code"] == "500"
+
+    def test_extract_error_from_sse_chunk_with_minimal_error(self):
+        """Test minimal error object"""
+        chunk = 'data: {"error": {"message": "error occurred"}}\n\n'
+        error = _extract_error_from_sse_chunk(chunk)
+
+        assert error["message"] == "error occurred"
+        # Other fields should be obtained from the original error object (if exists)
+
+
+class TestOverrideOpenAIResponseModel:
+    """Tests for _override_openai_response_model function"""
+
+    def test_override_model_preserves_fallback_model_when_fallback_occurred_object(self):
+        """
+        Test that when a fallback occurred (x-litellm-attempted-fallbacks > 0),
+        the actual model used (fallback model) is preserved instead of being
+        overridden with the requested model.
+        
+        This is the regression test to ensure the model being called is properly
+        displayed when a fallback happens.
+        """
+        requested_model = "gpt-4"
+        fallback_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response with fallback model
+        # _hidden_params is an attribute (not a dict key) accessed via getattr
+        response_obj = MagicMock()
+        response_obj.model = fallback_model
+        response_obj._hidden_params = {
+            "additional_headers": {
+                "x-litellm-attempted-fallbacks": 1
+            }
+        }
+        
+        # Call the function - should preserve fallback model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model was NOT overridden - should still be the fallback model
+        assert response_obj.model == fallback_model
+        assert response_obj.model != requested_model
+
+    def test_override_model_preserves_fallback_model_multiple_fallbacks(self):
+        """
+        Test that when multiple fallbacks occurred, the actual model used
+        (fallback model) is preserved.
+        """
+        requested_model = "gpt-4"
+        fallback_model = "claude-haiku-4-5-20251001"
+        
+        # Create a mock object response with fallback model
+        response_obj = MagicMock()
+        response_obj.model = fallback_model
+        response_obj._hidden_params = {
+            "additional_headers": {
+                "x-litellm-attempted-fallbacks": 2  # Multiple fallbacks
+            }
+        }
+        
+        # Call the function - should preserve fallback model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model was NOT overridden - should still be the fallback model
+        assert response_obj.model == fallback_model
+        assert response_obj.model != requested_model
+
+    def test_override_model_overrides_when_no_fallback_dict(self):
+        """
+        Test that when no fallback occurred, the model is overridden
+        to match the requested model (dict response).
+        """
+        requested_model = "gpt-4"
+        downstream_model = "gpt-3.5-turbo"
+        
+        # Create a dict response without fallback
+        # For dict responses, _hidden_params won't be found via getattr,
+        # so the fallback check won't trigger and model will be overridden
+        response_obj = {"model": downstream_model}
+        
+        # Call the function - should override to requested model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model WAS overridden to requested model
+        assert response_obj["model"] == requested_model
+
+    def test_override_model_overrides_when_no_fallback_object(self):
+        """
+        Test that when no fallback occurred (object response), the model is overridden
+        to match the requested model.
+        """
+        requested_model = "gpt-4"
+        downstream_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response without fallback
+        response_obj = MagicMock()
+        response_obj.model = downstream_model
+        response_obj._hidden_params = {
+            "additional_headers": {}  # No attempted_fallbacks header
+        }
+        
+        # Call the function - should override to requested model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model WAS overridden to requested model
+        assert response_obj.model == requested_model
+
+    def test_override_model_overrides_when_attempted_fallbacks_is_zero(self):
+        """
+        Test that when attempted_fallbacks is 0 (no fallback occurred),
+        the model is overridden to match the requested model.
+        """
+        requested_model = "gpt-4"
+        downstream_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response
+        response_obj = MagicMock()
+        response_obj.model = downstream_model
+        response_obj._hidden_params = {
+            "additional_headers": {
+                "x-litellm-attempted-fallbacks": 0  # Zero means no fallback occurred
+            }
+        }
+        
+        # Call the function - should override to requested model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model WAS overridden to requested model
+        assert response_obj.model == requested_model
+
+    def test_override_model_overrides_when_attempted_fallbacks_is_none(self):
+        """
+        Test that when attempted_fallbacks is None (not set),
+        the model is overridden to match the requested model.
+        """
+        requested_model = "gpt-4"
+        downstream_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response
+        response_obj = MagicMock()
+        response_obj.model = downstream_model
+        response_obj._hidden_params = {
+            "additional_headers": {
+                "x-litellm-attempted-fallbacks": None
+            }
+        }
+        
+        # Call the function - should override to requested model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model WAS overridden to requested model
+        assert response_obj.model == requested_model
+
+    def test_override_model_no_hidden_params(self):
+        """
+        Test that when _hidden_params is not present, the model is overridden
+        to match the requested model.
+        """
+        requested_model = "gpt-4"
+        downstream_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response without _hidden_params
+        response_obj = MagicMock()
+        response_obj.model = downstream_model
+        # Don't set _hidden_params - getattr will return {}
+        
+        # Call the function - should override to requested model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+        
+        # Verify the model WAS overridden to requested model
+        assert response_obj.model == requested_model
+
+    def test_override_model_no_requested_model(self):
+        """
+        Test that when requested_model is None or empty, the function returns early
+        without modifying the response.
+        """
+        fallback_model = "gpt-3.5-turbo"
+        
+        # Create a mock object response
+        response_obj = MagicMock()
+        response_obj.model = fallback_model
+        response_obj._hidden_params = {
+            "additional_headers": {
+                "x-litellm-attempted-fallbacks": 1
+            }
+        }
+        
+        # Call the function with None requested_model
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=None,
+            log_context="test_context",
+        )
+        
+        # Verify the model was not changed
+        assert response_obj.model == fallback_model
+        
+        # Call with empty string
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model="",
+            log_context="test_context",
+        )
+        
+        # Verify the model was not changed
+        assert response_obj.model == fallback_model
+
+
