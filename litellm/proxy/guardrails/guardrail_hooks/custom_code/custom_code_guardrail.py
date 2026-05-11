@@ -26,6 +26,12 @@ Example custom code (async with HTTP):
             if response["success"] and response["body"].get("flagged"):
                 return block("Content flagged by moderation API")
         return allow()
+
+Example: block when response rejects the user (input_type response only):
+
+    Use RESPONSE_REJECTION_GUARDRAIL_CODE from .response_rejection_code — it
+    checks response texts for phrases like "That's not something I can help with"
+    and returns block() so the guardrail raises a block error.
 """
 
 import asyncio
@@ -43,7 +49,7 @@ from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 from litellm.types.utils import GenericGuardrailAPIInputs
 
-from .primitives import get_custom_code_primitives
+from .sandbox import build_sandbox_globals, compile_sandboxed
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -137,6 +143,26 @@ class CustomCodeGuardrail(CustomGuardrail):
         """Returns the config model for the UI."""
         return CustomCodeGuardrailConfigModel
 
+    def _do_compile(self) -> None:
+        """Internal compilation method without lock. Expected to run inside _compile_lock."""
+        exec_globals = build_sandbox_globals()
+        compiled = compile_sandboxed(self.custom_code)
+        exec(compiled, exec_globals)  # noqa: S102
+
+        if "apply_guardrail" not in exec_globals:
+            raise CustomCodeCompilationError(
+                "Custom code must define an 'apply_guardrail' function. "
+                "Expected signature: apply_guardrail(inputs, request_data, input_type)"
+            )
+
+        apply_fn = exec_globals["apply_guardrail"]
+        if not callable(apply_fn):
+            raise CustomCodeCompilationError(
+                "'apply_guardrail' must be a callable function"
+            )
+
+        self._compiled_function = apply_fn
+
     def _compile_custom_code(self) -> None:
         """
         Compile the custom code and extract the apply_guardrail function.
@@ -148,27 +174,7 @@ class CustomCodeGuardrail(CustomGuardrail):
                 return
 
             try:
-                # Create a restricted execution environment
-                # Only include our safe primitives
-                exec_globals = get_custom_code_primitives().copy()
-
-                # Execute the user code in the restricted environment
-                exec(compile(self.custom_code, "<guardrail>", "exec"), exec_globals)
-
-                # Extract the apply_guardrail function
-                if "apply_guardrail" not in exec_globals:
-                    raise CustomCodeCompilationError(
-                        "Custom code must define an 'apply_guardrail' function. "
-                        "Expected signature: apply_guardrail(inputs, request_data, input_type)"
-                    )
-
-                apply_fn = exec_globals["apply_guardrail"]
-                if not callable(apply_fn):
-                    raise CustomCodeCompilationError(
-                        "'apply_guardrail' must be a callable function"
-                    )
-
-                self._compiled_function = apply_fn
+                self._do_compile()
                 verbose_proxy_logger.debug(
                     f"Custom code guardrail '{self.guardrail_name}' compiled successfully"
                 )
@@ -216,7 +222,6 @@ class CustomCodeGuardrail(CustomGuardrail):
             HTTPException: If content is blocked
             CustomCodeExecutionError: If execution fails
         """
-
         if self._compiled_function is None:
             if self._compile_error:
                 raise CustomCodeExecutionError(
@@ -394,12 +399,24 @@ class CustomCodeGuardrail(CustomGuardrail):
 
             try:
                 self.custom_code = new_code
-                self._compile_custom_code()
+                self._do_compile()
                 verbose_proxy_logger.info(
                     f"Custom code guardrail '{self.guardrail_name}': Code updated successfully"
                 )
+            except SyntaxError as e:
+                # Rollback on failure
+                self.custom_code = old_code
+                self._compiled_function = old_function
+                self._compile_error = f"Syntax error in custom code: {e}"
+                raise CustomCodeCompilationError(self._compile_error) from e
             except CustomCodeCompilationError:
                 # Rollback on failure
                 self.custom_code = old_code
                 self._compiled_function = old_function
                 raise
+            except Exception as e:
+                # Rollback on failure
+                self.custom_code = old_code
+                self._compiled_function = old_function
+                self._compile_error = f"Failed to compile custom code: {e}"
+                raise CustomCodeCompilationError(self._compile_error) from e
