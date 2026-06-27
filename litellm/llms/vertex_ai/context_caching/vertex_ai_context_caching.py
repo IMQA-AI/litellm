@@ -19,7 +19,7 @@ from litellm.types.llms.vertex_ai import (
     VertexAICachedContentResponseObject,
 )
 
-from ..common_utils import VertexAIError
+from ..common_utils import VertexAIError, get_vertex_base_url
 from ..vertex_llm_base import VertexBase
 from .transformation import (
     separate_cached_messages,
@@ -69,17 +69,13 @@ class ContextCachingEndpoints(VertexBase):
         elif custom_llm_provider == "vertex_ai":
             auth_header = vertex_auth_header
             endpoint = "cachedContents"
-            if vertex_location == "global":
-                url = f"https://aiplatform.googleapis.com/v1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
-            else:
-                url = f"https://{vertex_location}-aiplatform.googleapis.com/v1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
+            base_url = get_vertex_base_url(vertex_location)
+            url = f"{base_url}/v1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
         else:
             auth_header = vertex_auth_header
             endpoint = "cachedContents"
-            if vertex_location == "global":
-                url = f"https://aiplatform.googleapis.com/v1beta1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
-            else:
-                url = f"https://{vertex_location}-aiplatform.googleapis.com/v1beta1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
+            base_url = get_vertex_base_url(vertex_location)
+            url = f"{base_url}/v1beta1/projects/{vertex_project}/locations/{vertex_location}/{endpoint}"
 
         return self._check_custom_proxy(
             api_base=api_base,
@@ -419,7 +415,9 @@ class ContextCachingEndpoints(VertexBase):
 
         try:
             response = client.post(
-                url=url, headers=headers, json=cached_content_request_body  # type: ignore
+                url=url,
+                headers=headers,
+                json=cached_content_request_body,  # type: ignore
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
@@ -570,7 +568,9 @@ class ContextCachingEndpoints(VertexBase):
 
         try:
             response = await client.post(
-                url=url, headers=headers, json=cached_content_request_body  # type: ignore
+                url=url,
+                headers=headers,
+                json=cached_content_request_body,  # type: ignore
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as err:

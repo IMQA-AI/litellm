@@ -79,6 +79,7 @@ if MCP_AVAILABLE:
     )
     from litellm.proxy._experimental.mcp_server.server import (
         ListMCPToolsRestAPIResponseObject,
+        MCPInfo,
         MCPServer,
         _tool_name_matches,
         execute_mcp_tool,
@@ -238,14 +239,24 @@ if MCP_AVAILABLE:
             )
             return {}
 
-    def _create_tool_response_objects(tools, server_mcp_info):
-        """Helper function to create tool response objects."""
+    def _create_tool_response_objects(tools, server: MCPServer):
+        """Helper function to create tool response objects.
+
+        Enriches the server's ``mcp_info`` with ``server_id`` and ``alias`` so
+        REST clients can map the internal ``server_name`` to the user-facing
+        alias without needing access to the ``mcp_routes``-gated server listing.
+        """
+        enriched_mcp_info: MCPInfo = {
+            **(server.mcp_info or {}),
+            "server_id": server.server_id,
+            "alias": server.alias,
+        }
         return [
             ListMCPToolsRestAPIResponseObject(
                 name=tool.name,
                 description=tool.description,
                 inputSchema=tool.inputSchema,
-                mcp_info=server_mcp_info,
+                mcp_info=enriched_mcp_info,
             )
             for tool in tools
         ]
@@ -386,8 +397,15 @@ if MCP_AVAILABLE:
         raw_headers: Optional[Dict[str, str]] = None,
         user_api_key_auth: Optional[UserAPIKeyAuth] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        apply_tool_filters: bool = True,
     ):
-        """Helper function to get tools for a single server."""
+        """Helper function to get tools for a single server.
+
+        When ``apply_tool_filters`` is False the raw server catalog is returned
+        without the allowed_tools/disallowed_tools gate or the per-key tool
+        permissions. This is the admin-only configuration view; every runtime
+        path keeps the default True so callable tools stay filtered.
+        """
         tools = await global_mcp_server_manager._get_tools_from_server(
             server=server,
             mcp_auth_header=server_auth_header,
@@ -396,6 +414,9 @@ if MCP_AVAILABLE:
             raw_headers=raw_headers,
             user_api_key_auth=user_api_key_auth,
         )
+
+        if not apply_tool_filters:
+            return _create_tool_response_objects(tools, server)
 
         # Always apply allowed_tools/disallowed_tools so the blacklist is
         # enforced even when no allowlist is set (matches the SSE/HTTP path).
@@ -426,7 +447,7 @@ if MCP_AVAILABLE:
                     if _tool_name_matches(tool.name, allowed_tools_for_server)
                 ]
 
-        return _create_tool_response_objects(tools, server.mcp_info)
+        return _create_tool_response_objects(tools, server)
 
     async def _resolve_allowed_mcp_servers_for_tool_call(
         user_api_key_dict: UserAPIKeyAuth,
@@ -463,6 +484,7 @@ if MCP_AVAILABLE:
         mcp_auth_header: Optional[str],
         raw_headers_from_request: dict,
         user_api_key_dict: UserAPIKeyAuth,
+        apply_tool_filters: bool = True,
     ) -> dict:
         """Handle tool listing for a single server_id request."""
         # Resolve a server name to its UUID if needed
@@ -527,6 +549,7 @@ if MCP_AVAILABLE:
                 raw_headers_from_request,
                 user_api_key_dict,
                 extra_headers=user_oauth_extra_headers,
+                apply_tool_filters=apply_tool_filters,
             )
         except MCPUpstreamAuthError:
             # Surface the upstream 401/403 to the caller so it can emit the
@@ -552,6 +575,14 @@ if MCP_AVAILABLE:
         server_id: Optional[str] = Query(
             None, description="The server id to list tools for"
         ),
+        include_disabled_tools: bool = Query(
+            False,
+            description=(
+                "Admin only. Return the full server tool catalog without the "
+                "allowed_tools filter or per-key tool permissions, so the MCP "
+                "settings UI can configure the allowlist. Ignored for non-admins."
+            ),
+        ),
         user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     ) -> dict:
         """
@@ -567,6 +598,8 @@ if MCP_AVAILABLE:
                     "mcp_info": {
                         "server_name": "zapier",
                         "logo_url": "https://www.zapier.com/logo.png",
+                        "server_id": "a1b2c3d4-...",
+                        "alias": "zapier_prod",
                     }
                 }
             ],
@@ -579,6 +612,13 @@ if MCP_AVAILABLE:
         )
 
         try:
+            # The full catalog (allowlist filter skipped) is admin-only so the
+            # REST endpoint can't be used to enumerate deliberately-disabled tools.
+            apply_tool_filters = not (
+                include_disabled_tools
+                and user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+            )
+
             # Extract auth headers from request
             headers = request.headers
             raw_headers_from_request = dict(headers)
@@ -620,6 +660,7 @@ if MCP_AVAILABLE:
                     mcp_auth_header=mcp_auth_header,
                     raw_headers_from_request=raw_headers_from_request,
                     user_api_key_dict=user_api_key_dict,
+                    apply_tool_filters=apply_tool_filters,
                 )
             else:
                 if not allowed_server_ids:
@@ -677,6 +718,7 @@ if MCP_AVAILABLE:
                             raw_headers_from_request,
                             user_api_key_dict,
                             extra_headers=user_oauth_extra_headers,
+                            apply_tool_filters=apply_tool_filters,
                         )
                         list_tools_result.extend(tools_result)
                     except Exception as e:

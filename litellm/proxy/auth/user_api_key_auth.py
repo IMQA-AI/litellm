@@ -21,9 +21,9 @@ from fastapi.security.api_key import APIKeyHeader
 import litellm
 from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
+from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
 from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_span, seed_request_identity
-from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.dot_notation_indexing import get_nested_value
 from litellm.proxy._types import *
@@ -42,7 +42,6 @@ from litellm.proxy.auth.auth_checks import (
     common_checks,
     get_end_user_object,
     get_jwt_key_mapping_object,
-    get_key_object,
     get_project_object,
     get_team_object,
     get_user_object,
@@ -63,9 +62,13 @@ from litellm.proxy.auth.auth_utils import (
 from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
 from litellm.proxy.auth.oauth2_check import Oauth2Handler
 from litellm.proxy.auth.oauth2_proxy_hook import handle_oauth2_proxy_request
+from litellm.proxy.auth.auth_method import AuthMethod
+from litellm.proxy.auth.network import TrustedProxyConfig, resolve_network_context
+from litellm.proxy.auth.resolvers import CredentialRef, Principal
+from litellm.proxy.auth.resolvers.store import IdentityStore
 from litellm.proxy.auth.route_checks import RouteChecks
+from litellm.proxy.auth.trusted_proxy_utils import get_trusted_proxy_cidrs
 from litellm.proxy.common_utils.cache_coordinator import EventDrivenCacheCoordinator
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
@@ -73,12 +76,14 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     populate_request_with_path_params,
 )
 from litellm.proxy.common_utils.realtime_utils import _realtime_request_body
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.proxy.utils import (
     PrismaClient,
     ProxyLogging,
     normalize_route_for_root_path,
 )
+from litellm.repositories.table_repositories import TeamMembershipRepository
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.services import ServiceTypes
 
@@ -757,12 +762,13 @@ async def _auto_register_jwt_mapping(
         claim_value,
     )
 
-    auto_registered_key = await get_key_object(
-        hashed_token=token_hash,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        parent_otel_span=parent_otel_span,
-        proxy_logging_obj=proxy_logging_obj,
+    auto_registered_key = IdentityStore.key_from_principal(
+        await IdentityStore(
+            prisma_client,
+            user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+        ).resolve(hashed_token=token_hash)
     )
     if auto_registered_key is not None:
         auto_registered_key.org_id = org_id
@@ -864,12 +870,13 @@ async def _resolve_jwt_to_virtual_key(
             )
         return None
     elif cached_mapping is not None:
-        return await get_key_object(
-            hashed_token=cached_mapping,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
+        return IdentityStore.key_from_principal(
+            await IdentityStore(
+                prisma_client,
+                user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            ).resolve(hashed_token=cached_mapping)
         )
 
     # Resolve the mapping from DB, or treat prisma_client=None as a definitive
@@ -888,12 +895,13 @@ async def _resolve_jwt_to_virtual_key(
             value=token_hash,
             ttl=jwt_handler.litellm_jwtauth.virtual_key_mapping_cache_ttl,
         )
-        return await get_key_object(
-            hashed_token=token_hash,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
+        return IdentityStore.key_from_principal(
+            await IdentityStore(
+                prisma_client,
+                user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            ).resolve(hashed_token=token_hash)
         )
 
     # No mapping found (DB miss or no DB) — apply no-match policy.
@@ -978,7 +986,7 @@ def _ensure_parent_otel_span_on_request_state(request: Request) -> None:
     request.state.parent_otel_span = parent_otel_span
 
 
-async def _user_api_key_auth_builder(  # noqa: PLR0915
+async def _user_api_key_auth_builder(
     request: Request,
     api_key: str,
     azure_api_key_header: str,
@@ -1492,20 +1500,29 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
             ## Check CACHE
             try:
                 with tracer.trace("litellm.proxy.auth.get_key_object_check_cache"):
-                    valid_token = await get_key_object(
-                        hashed_token=hash_token(api_key),
-                        prisma_client=prisma_client,
-                        user_api_key_cache=user_api_key_cache,
-                        parent_otel_span=parent_otel_span,
-                        proxy_logging_obj=proxy_logging_obj,
-                        check_cache_only=True,
+                    valid_token = IdentityStore.key_from_principal(
+                        await IdentityStore(
+                            prisma_client,
+                            user_api_key_cache,
+                            parent_otel_span=parent_otel_span,
+                            proxy_logging_obj=proxy_logging_obj,
+                            check_cache_only=True,
+                        ).resolve(hashed_token=hash_token(api_key))
                     )
             except Exception:
                 verbose_logger.debug("api key not found in cache.")
                 valid_token = None
 
-            ## Check UI Hash Key
-            if valid_token is None and get_secret_bool("EXPERIMENTAL_UI_LOGIN"):
+            ## Check UI/CLI Hash Key
+            # Attempt decryption for non-sk- tokens unless the operator has
+            # explicitly set EXPERIMENTAL_UI_LOGIN=false to disable it.
+            # Unset (None) keeps the new default of always attempting decryption;
+            # decryption fails closed for anything that is not a genuine blob.
+            if (
+                valid_token is None
+                and not api_key.startswith("sk-")
+                and get_secret_bool("EXPERIMENTAL_UI_LOGIN") is not False
+            ):
                 valid_token = ExperimentalUIJWTToken.get_key_object_from_ui_hash_key(
                     api_key
                 )
@@ -1678,12 +1695,13 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
 
             try:
                 with tracer.trace("litellm.proxy.auth.get_key_object_from_db"):
-                    valid_token = await get_key_object(
-                        hashed_token=api_key,
-                        prisma_client=prisma_client,
-                        user_api_key_cache=user_api_key_cache,
-                        parent_otel_span=parent_otel_span,
-                        proxy_logging_obj=proxy_logging_obj,
+                    valid_token = IdentityStore.key_from_principal(
+                        await IdentityStore(
+                            prisma_client,
+                            user_api_key_cache,
+                            parent_otel_span=parent_otel_span,
+                            proxy_logging_obj=proxy_logging_obj,
+                        ).resolve(hashed_token=api_key)
                     )
             except ProxyException as e:
                 if e.code == 401 or e.code == "401":
@@ -1797,7 +1815,9 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
                         _team_id = valid_token.team_id
 
                         if _user_id is not None and _team_id is not None:
-                            _db_member = await prisma_client.db.litellm_teammembership.find_first(
+                            _db_member = await TeamMembershipRepository(
+                                prisma_client
+                            ).table.find_first(
                                 where={
                                     "user_id": _user_id,
                                     "team_id": _team_id,
@@ -1834,6 +1854,7 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
                                 team_member_spend = await get_current_spend(
                                     counter_key=f"spend:team_member:{valid_token.user_id}:{valid_token.team_id}",
                                     fallback_spend=team_member_spend,
+                                    max_budget=team_member_budget,
                                 )
                             if team_member_spend > team_member_budget:
                                 raise litellm.BudgetExceededError(
@@ -1970,13 +1991,16 @@ async def _user_api_key_auth_builder(  # noqa: PLR0915
             else:
                 valid_token.team_object_permission = None
 
-            # Only cache when the key is a real team_id (non-team keys must not use key=None).
+            # Cache under the canonical "team_id:{id}" key so get_team_object and
+            # _update_team_cache serve this write from the L2 cache. The guard keeps a
+            # non-team (personal) key, whose team_id is None, from reaching the cache
+            # layer, which Redis rejects with a NoneType key error.
             if valid_token.team_id is not None and _team_obj is not None:
                 await user_api_key_cache.async_set_cache(
-                    key=valid_token.team_id,
+                    key=f"team_id:{valid_token.team_id}",
                     value=_team_obj,
                     model_type=LiteLLM_TeamTableCachedObj,
-                )  # save team table in cache - used for tpm/rpm limiting - tpm_rpm_limiter.py
+                )
 
             # Fetch project object if key belongs to a project
             _project_obj = None
@@ -2123,7 +2147,7 @@ def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCached
 
 
 @tracer.wrap()
-async def _run_centralized_common_checks(  # noqa: PLR0915
+async def _run_centralized_common_checks(
     user_api_key_auth_obj: UserAPIKeyAuth,
     request: Request,
     request_data: dict,
@@ -2383,6 +2407,17 @@ async def _run_centralized_common_checks(  # noqa: PLR0915
         llm_router=llm_router,
     )
 
+    # Pin the metadata variable name (litellm_metadata vs metadata) before
+    # any tag merge runs. Without this, header tags from
+    # apply_client_tag_policy_pre_auth would land in `metadata` while the
+    # later seed in common_checks pushes key tags and the
+    # _tag_max_budget_check read into `litellm_metadata`, hiding header
+    # tags from per-tag budget enforcement on LITELLM_METADATA_ROUTES.
+    LiteLLMProxyRequestSetup.pre_seed_litellm_metadata_for_route(
+        request_data=request_data,
+        route=route,
+    )
+
     # Merge x-litellm-tags into request_data BEFORE common_checks runs.
     # _tag_max_budget_check inside common_checks only inspects request_data;
     # without this pre-merge, header-supplied tags bypass tag-budget
@@ -2422,6 +2457,7 @@ async def _run_centralized_common_checks(  # noqa: PLR0915
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
         skip_budget_checks=skip_budget_checks,
+        general_settings=general_settings,
     )
 
 
@@ -2442,11 +2478,22 @@ async def _reserve_budget_after_common_checks(
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: ProxyLogging,
     skip_budget_checks: bool,
+    general_settings: dict,
     end_user_id: Optional[str] = None,
     end_user_object: Optional[LiteLLM_EndUserTable] = None,
 ) -> None:
     user_api_key_auth_obj.budget_reservation = None
     if skip_budget_checks:
+        return
+    if general_settings.get("disable_budget_reservation") is True:
+        verbose_proxy_logger.warning(
+            "disable_budget_reservation is enabled: skipping optimistic budget "
+            "reservation. Budget enforcement is read-time only — concurrent "
+            "requests can each pass the spend check before their cost is recorded, "
+            "so a configured budget may be briefly exceeded under high concurrency. "
+            "Set disable_budget_reservation to False or remove it to restore "
+            "hard per-request budget enforcement."
+        )
         return
 
     from litellm.proxy.spend_tracking.budget_reservation import (
@@ -2483,6 +2530,34 @@ def _should_skip_budget_checks(
     if model is not None and llm_router is not None:
         return _is_model_cost_zero(model=model, llm_router=llm_router)
     return False
+
+
+def _resolve_request_principal(
+    request: Request, valid_token: UserAPIKeyAuth
+) -> Principal:
+    """Project the resolved identity into one per-request Principal, off the key
+    object the builder already fetched, and stamp the request network context
+    onto it once. X-Forwarded-For is only trusted when the operator configured
+    ``trusted_proxy_ranges``; otherwise the direct peer is authoritative.
+
+    credential_ref and a stable subject fallback are always set off the token so
+    the Principal can never be anonymous, even for a keyless service-account key
+    with no user or alias."""
+    cidrs = get_trusted_proxy_cidrs()
+    network = resolve_network_context(
+        request,
+        TrustedProxyConfig(use_forwarded_for=bool(cidrs), trusted_proxy_cidrs=cidrs),
+    )
+    auth_method = (
+        AuthMethod.BEARER_JWT if valid_token.jwt_claims else AuthMethod.API_KEY
+    )
+    return IdentityStore._principal_from_key(
+        valid_token,
+        auth_method=auth_method,
+        network=network,
+        subject_fallback=valid_token.token,
+        credential_ref=CredentialRef(token_id=valid_token.token),
+    )
 
 
 @tracer.wrap()
@@ -2599,6 +2674,22 @@ async def user_api_key_auth(
         model=request_data.get("model") if isinstance(request_data, dict) else None,
     )
     user_api_key_auth_obj.request_route = normalize_request_route(route)
+
+    # Resolve caller identity once, here at the seam, into a single per-request
+    # Principal projected off the key object the builder already fetched (no
+    # second lookup). Downstream consumers read identity off this instead of
+    # re-resolving it. Additive and defensive: a projection failure must never
+    # reject an already-authenticated request, so it is left unset on failure;
+    # any future consumer must treat a missing principal as deny, not allow.
+    try:
+        request.state.principal = _resolve_request_principal(
+            request, user_api_key_auth_obj
+        )
+    except Exception as e:
+        verbose_proxy_logger.warning(
+            "Principal projection at auth seam failed (non-fatal): %s", e
+        )
+
     return user_api_key_auth_obj
 
 
@@ -2646,9 +2737,9 @@ async def _return_user_api_key_auth_obj(
         user_api_key_kwargs.update(
             user_role=LitellmUserRoles.PROXY_ADMIN,
         )
-        return UserAPIKeyAuth(**user_api_key_kwargs)
+        return UserAPIKeyAuth.model_validate(user_api_key_kwargs)
     else:
-        return UserAPIKeyAuth(**user_api_key_kwargs)
+        return UserAPIKeyAuth.model_validate(user_api_key_kwargs)
 
 
 def get_api_key_from_custom_header(
